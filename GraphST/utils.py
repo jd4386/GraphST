@@ -30,7 +30,7 @@ def mclust_R(adata, num_cluster, modelNames='EEE', used_obsm='emb_pca', random_s
     adata.obs['mclust'] = adata.obs['mclust'].astype('category')
     return adata
 
-def clustering(adata, n_clusters=7, radius=50, key='emb', method='mclust', start=0.1, end=3.0, increment=0.01, refinement=False):
+def clustering(adata, n_clusters=7, radius=50, key='emb', method='mclust', start=0.1, end=3.0, increment=0.01, refinement=False, resolution=None):
     """\
     Spatial clustering based the learned representation.
 
@@ -39,21 +39,24 @@ def clustering(adata, n_clusters=7, radius=50, key='emb', method='mclust', start
     adata : anndata
         AnnData object of scanpy package.
     n_clusters : int, optional
-        The number of clusters. The default is 7.
+        The number of clusters. The default is 7. Ignored for Leiden/Louvain when resolution is provided.
     radius : int, optional
         The number of neighbors considered during refinement. The default is 50.
     key : string, optional
         The key of the learned representation in adata.obsm. The default is 'emb'.
     method : string, optional
-        The tool for clustering. Supported tools include 'mclust', 'leiden', and 'louvain'. The default is 'mclust'. 
+        The tool for clustering. Supported tools include 'mclust', 'leiden', and 'louvain'. The default is 'mclust'.
     start : float
         The start value for searching. The default is 0.1.
-    end : float 
+    end : float
         The end value for searching. The default is 3.0.
     increment : float
-        The step size to increase. The default is 0.01.   
+        The step size to increase. The default is 0.01.
     refinement : bool, optional
         Refine the predicted labels or not. The default is False.
+    resolution : float, optional
+        If provided and method is 'leiden' or 'louvain', use this resolution directly and skip search_res.
+        n_clusters is ignored in that case.
 
     Returns
     -------
@@ -69,12 +72,20 @@ def clustering(adata, n_clusters=7, radius=50, key='emb', method='mclust', start
        adata = mclust_R(adata, used_obsm='emb_pca', num_cluster=n_clusters)
        adata.obs['domain'] = adata.obs['mclust']
     elif method == 'leiden':
-       res = search_res(adata, n_clusters, use_rep='emb_pca', method=method, start=start, end=end, increment=increment)
-       sc.tl.leiden(adata, random_state=0, resolution=res)
+       if resolution is not None:
+           sc.pp.neighbors(adata, n_neighbors=50, use_rep='emb_pca')
+           sc.tl.leiden(adata, random_state=0, resolution=resolution)
+       else:
+           res = search_res(adata, n_clusters, use_rep='emb_pca', method=method, start=start, end=end, increment=increment)
+           sc.tl.leiden(adata, random_state=0, resolution=res)
        adata.obs['domain'] = adata.obs['leiden']
     elif method == 'louvain':
-       res = search_res(adata, n_clusters, use_rep='emb_pca', method=method, start=start, end=end, increment=increment)
-       sc.tl.louvain(adata, random_state=0, resolution=res)
+       if resolution is not None:
+           sc.pp.neighbors(adata, n_neighbors=50, use_rep='emb_pca')
+           sc.tl.louvain(adata, random_state=0, resolution=resolution)
+       else:
+           res = search_res(adata, n_clusters, use_rep='emb_pca', method=method, start=start, end=end, increment=increment)
+           sc.tl.louvain(adata, random_state=0, resolution=res)
        adata.obs['domain'] = adata.obs['louvain'] 
        
     if refinement:  
@@ -233,4 +244,72 @@ def search_res(adata, n_clusters, method='leiden', use_rep='emb', start=0.1, end
 
     assert label==1, "Resolution is not found. Please try bigger range or smaller step!." 
        
-    return res    
+    return res
+
+
+def resolution_sweep_leiden(
+    adata,
+    start=0.1,
+    end=2.0,
+    step=0.05,
+    use_rep="emb_pca",
+    n_neighbors=50,
+    random_state=0,
+):
+    """\
+    Fix the neighbor graph once and run Leiden at many resolutions; record
+    number of clusters, silhouette score, and Davies–Bouldin score per resolution.
+
+    If adata.obsm[use_rep] is missing but 'emb' exists, PCA (20 components) is
+    applied to 'emb' to create 'emb_pca'. Builds neighbors once, then sweeps
+    resolution. Modifies adata in place (adds emb_pca/neighbors and overwrites
+    adata.obs['leiden'] at each step).
+
+    Parameters
+    ----------
+    adata : anndata.AnnData
+        Must have .obsm[use_rep] or .obsm['emb'].
+    start : float
+        Start of resolution range (inclusive).
+    end : float
+        End of resolution range (exclusive).
+    step : float
+        Resolution step size.
+    use_rep : str
+        Key in adata.obsm for clustering (default 'emb_pca').
+    n_neighbors : int
+        For sc.pp.neighbors (default 50).
+    random_state : int
+        For sc.tl.leiden (default 0).
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: resolution, n_clusters, silhouette_score, davies_bouldin_score.
+    """
+    if use_rep not in adata.obsm and "emb" in adata.obsm:
+        pca = PCA(n_components=20, random_state=42)
+        adata.obsm[use_rep] = pca.fit_transform(adata.obsm["emb"].copy())
+    X = adata.obsm[use_rep]
+    sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep=use_rep)
+    resolutions = np.arange(start, end, step)
+    resolutions = np.round(resolutions, decimals=min(5, max(0, -int(np.floor(np.log10(step))))))
+    rows = []
+    for res in resolutions:
+        res = float(res)
+        sc.tl.leiden(adata, random_state=random_state, resolution=res)
+        labels = adata.obs["leiden"].astype(str).values
+        n_clusters = len(np.unique(labels))
+        if n_clusters <= 1:
+            sil = np.nan
+            db = np.nan
+        else:
+            sil = metrics.silhouette_score(X, labels, metric="euclidean")
+            db = metrics.davies_bouldin_score(X, labels)
+        rows.append({
+            "resolution": res,
+            "n_clusters": n_clusters,
+            "silhouette_score": sil,
+            "davies_bouldin_score": db,
+        })
+    return pd.DataFrame(rows)

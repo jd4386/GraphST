@@ -1,1 +1,1 @@
-
+Upstream GraphST example data (e.g. `151673/`). Not used by the SARSIM pipeline, which reads paths from `config/patient_manifest.csv`. Safe to remove to reduce repo size if you do not need it for GraphST demos.
