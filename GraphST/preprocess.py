@@ -125,6 +125,24 @@ def add_contrastive_label(adata):
     zero_matrix = np.zeros([n_spot, 1])
     label_CSL = np.concatenate([one_matrix, zero_matrix], axis=1)
     adata.obsm['label_CSL'] = label_CSL
+
+
+def build_cluster_adjacency(spot_cluster_labels, missing_label=-1):
+    """Build same-cluster adjacency: cluster_adj[i,j]=1 iff same non-missing cluster.
+    Does not add self-loops (caller adds eye if needed)."""
+    spot_cluster_labels = np.asarray(spot_cluster_labels).ravel()
+    n_spot = spot_cluster_labels.shape[0]
+    valid = spot_cluster_labels != missing_label
+    cluster_adj = np.zeros((n_spot, n_spot), dtype=np.float64)
+    for k in np.unique(spot_cluster_labels):
+        if k == missing_label:
+            continue
+        idx = np.where(spot_cluster_labels == k)[0]
+        for i in range(len(idx)):
+            for j in range(i + 1, len(idx)):
+                cluster_adj[idx[i], idx[j]] = 1
+                cluster_adj[idx[j], idx[i]] = 1
+    return cluster_adj
     
 def normalize_adj(adj):
     """Symmetrically normalize adjacency matrix."""

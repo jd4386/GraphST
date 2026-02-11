@@ -1,5 +1,5 @@
 import torch
-from .preprocess import preprocess_adj, preprocess_adj_sparse, preprocess, construct_interaction, construct_interaction_KNN, add_contrastive_label, get_feature, permutation, fix_seed
+from .preprocess import preprocess_adj, preprocess_adj_sparse, preprocess, construct_interaction, construct_interaction_KNN, add_contrastive_label, get_feature, permutation, fix_seed, build_cluster_adjacency
 import time
 import random
 import numpy as np
@@ -28,8 +28,10 @@ class GraphST():
         theta = 0.1,
         lamda1 = 10,
         lamda2 = 1,
+        lamda_cluster = 0.0,
         deconvolution = False,
-        datatype = '10X'
+        datatype = '10X',
+        spot_cluster_labels = None
         ):
         '''\
 
@@ -67,6 +69,12 @@ class GraphST():
         lamda2 : float, optional
             Weight factor to control the influence of contrastive loss in mapping matrix learning. 
             The default is 1.
+        lamda_cluster : float, optional
+            Weight for within-cluster smoothness loss on W (used only when spot_cluster_labels is provided).
+            The default is 0.0 when no labels, else e.g. 1.0.
+        spot_cluster_labels : array-like, optional
+            1D integer array (length n_spot); -1 for missing. When provided, same-cluster spots are added
+            as positive pairs in contrastive learning and within-cluster smoothness is applied to W.
         deconvolution : bool, optional
             Deconvolution task? The default is False.
         datatype : string, optional    
@@ -88,6 +96,8 @@ class GraphST():
         self.theta = theta
         self.lamda1 = lamda1
         self.lamda2 = lamda2
+        self.lamda_cluster = lamda_cluster if spot_cluster_labels is not None else 0.0
+        self.spot_cluster_labels = spot_cluster_labels
         self.deconvolution = deconvolution
         self.datatype = datatype
         
@@ -112,7 +122,15 @@ class GraphST():
         self.features_a = torch.FloatTensor(self.adata.obsm['feat_a'].copy()).to(self.device)
         self.label_CSL = torch.FloatTensor(self.adata.obsm['label_CSL']).to(self.device)
         self.adj = self.adata.obsm['adj']
-        self.graph_neigh = torch.FloatTensor(self.adata.obsm['graph_neigh'].copy() + np.eye(self.adj.shape[0])).to(self.device)
+        graph_neigh = self.adata.obsm['graph_neigh'].copy().astype(np.float64) + np.eye(self.adj.shape[0])
+        if spot_cluster_labels is not None:
+            spot_cluster_labels = np.asarray(spot_cluster_labels).ravel()
+            if len(spot_cluster_labels) != graph_neigh.shape[0]:
+                raise ValueError("spot_cluster_labels length must match n_spot")
+            cluster_adj = build_cluster_adjacency(spot_cluster_labels, missing_label=-1)
+            graph_neigh = np.maximum(graph_neigh, cluster_adj)
+            graph_neigh = (graph_neigh > 0).astype(np.float64)
+        self.graph_neigh = torch.FloatTensor(graph_neigh).to(self.device)
     
         self.dim_input = self.features.shape[1]
         self.dim_output = dim_output
@@ -241,9 +259,9 @@ class GraphST():
             self.model_map.train()
             self.map_matrix = self.model_map()
 
-            loss_recon, loss_NCE = self.loss(emb_sp, emb_sc)
+            loss_recon, loss_NCE, loss_cluster = self.loss(emb_sp, emb_sc)
              
-            loss = self.lamda1*loss_recon + self.lamda2*loss_NCE 
+            loss = self.lamda1*loss_recon + self.lamda2*loss_NCE + self.lamda_cluster * loss_cluster 
 
             self.optimizer_map.zero_grad()
             loss.backward()
@@ -277,7 +295,7 @@ class GraphST():
 
         Returns
         -------
-        Loss values.
+        loss_recon, loss_NCE, loss_cluster (loss_cluster is 0 if no spot_cluster_labels).
 
         '''
         # cell-to-spot
@@ -286,8 +304,36 @@ class GraphST():
            
         loss_recon = F.mse_loss(self.pred_sp, emb_sp, reduction='mean')
         loss_NCE = self.Noise_Cross_Entropy(self.pred_sp, emb_sp)
+        
+        # Within-cluster smoothness on W rows (map_matrix columns).
+        # Use variance formulation: sum_{i<j} ||col_i - col_j||^2 = n_k * sum_i ||col_i - mean||^2
+        # per cluster, to avoid O(n_pairs) computation graph and GPU OOM.
+        if self.spot_cluster_labels is not None and self.lamda_cluster > 0:
+            labels = np.asarray(self.spot_cluster_labels).ravel()
+            n_pairs_total = 0
+            loss_cluster_sum = 0.0
+            for k in np.unique(labels):
+                if k == -1:
+                    continue
+                idx = np.where(labels == k)[0]
+                if len(idx) < 2:
+                    continue
+                n_k = len(idx)
+                cols = self.map_matrix[:, idx]
+                mean_k = cols.mean(dim=1, keepdim=True)
+                diff = cols - mean_k
+                var_sum_k = (diff * diff).sum()
+                # sum_{i<j} ||col_i - col_j||^2 = n_k * var_sum_k (identity)
+                loss_cluster_sum = loss_cluster_sum + n_k * var_sum_k
+                n_pairs_total += n_k * (n_k - 1) // 2
+            if n_pairs_total > 0:
+                loss_cluster = loss_cluster_sum / n_pairs_total
+            else:
+                loss_cluster = torch.tensor(0.0, device=self.device, dtype=self.map_matrix.dtype)
+        else:
+            loss_cluster = torch.tensor(0.0, device=self.device, dtype=self.map_matrix.dtype)
            
-        return loss_recon, loss_NCE
+        return loss_recon, loss_NCE, loss_cluster
         
     def Noise_Cross_Entropy(self, pred_sp, emb_sp):
         '''\
