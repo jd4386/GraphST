@@ -313,3 +313,104 @@ def resolution_sweep_leiden(
             "davies_bouldin_score": db,
         })
     return pd.DataFrame(rows)
+
+
+def _identify_plateaus(sweep_df, min_length):
+    """Return list of (start_idx, end_idx) slices of consecutive rows with same n_clusters and length >= min_length."""
+    if sweep_df is None or len(sweep_df) == 0:
+        return []
+    plateaus = []
+    i = 0
+    while i < len(sweep_df):
+        k = sweep_df.iloc[i]["n_clusters"]
+        j = i + 1
+        while j < len(sweep_df) and sweep_df.iloc[j]["n_clusters"] == k:
+            j += 1
+        if j - i >= min_length:
+            plateaus.append((i, j))
+        i = j
+    return plateaus
+
+
+def pick_resolution_from_sweep(
+    sweep_df,
+    metric,
+    k_min=2,
+    k_max=15,
+    plateau_min_length=3,
+):
+    """\
+    Pick a single (resolution, n_clusters) from a resolution-sweep DataFrame.
+
+    Parameters
+    ----------
+    sweep_df : pd.DataFrame
+        From resolution_sweep_leiden: columns resolution, n_clusters, silhouette_score, davies_bouldin_score.
+    metric : str
+        'silhouette': max silhouette in [k_min, k_max].
+        'davies_bouldin': min davies_bouldin in [k_min, k_max].
+        'combined': plateaus of stable n_clusters (length >= plateau_min_length), score Q = silhouette - lambda*davies_bouldin
+        (lambda = median_sil / median_db), pick best plateau; return mid resolution and its n_clusters.
+    k_min, k_max : int
+        Only consider rows with n_clusters in [k_min, k_max] (inclusive).
+    plateau_min_length : int
+        Minimum plateau length for 'combined' metric.
+
+    Returns
+    -------
+    resolution : float
+    n_clusters : int
+    plateau_df : pd.DataFrame or None
+        For 'combined', the rows of the chosen plateau; otherwise None.
+    """
+    if sweep_df is None or len(sweep_df) == 0:
+        raise ValueError("sweep_df is empty")
+    for col in ("resolution", "n_clusters", "silhouette_score", "davies_bouldin_score"):
+        if col not in sweep_df.columns:
+            raise ValueError(f"sweep_df missing column: {col}")
+    subset = sweep_df[
+        (sweep_df["n_clusters"] >= k_min) & (sweep_df["n_clusters"] <= k_max)
+    ].copy()
+    subset = subset.dropna(subset=["silhouette_score", "davies_bouldin_score"])
+    if len(subset) == 0:
+        # Fallback: use full sweep without k filter
+        subset = sweep_df.dropna(subset=["silhouette_score", "davies_bouldin_score"])
+    if len(subset) == 0:
+        row = sweep_df.iloc[len(sweep_df) // 2]
+        return (float(row["resolution"]), int(row["n_clusters"]), None)
+
+    if metric == "silhouette":
+        idx = subset["silhouette_score"].idxmax()
+        row = subset.loc[idx]
+        return (float(row["resolution"]), int(row["n_clusters"]), None)
+    if metric == "davies_bouldin":
+        idx = subset["davies_bouldin_score"].idxmin()
+        row = subset.loc[idx]
+        return (float(row["resolution"]), int(row["n_clusters"]), None)
+    if metric == "combined":
+        plateaus = _identify_plateaus(subset, plateau_min_length)
+        if not plateaus:
+            # No plateau: pick by single best silhouette in subset
+            idx = subset["silhouette_score"].idxmax()
+            row = subset.loc[idx]
+            return (float(row["resolution"]), int(row["n_clusters"]), None)
+        median_s = subset["silhouette_score"].median()
+        median_db = subset["davies_bouldin_score"].median()
+        lam = median_s / median_db if median_db and median_db != 0 else 1.0
+        best_plateau = None
+        best_q = -np.inf
+        best_plateau_df = None
+        for start, end in plateaus:
+            plat = subset.iloc[start:end]
+            q = plat["silhouette_score"].mean() - lam * plat["davies_bouldin_score"].mean()
+            if q > best_q:
+                best_q = q
+                best_plateau = (start, end)
+                best_plateau_df = plat
+        if best_plateau is None:
+            row = subset.iloc[len(subset) // 2]
+            return (float(row["resolution"]), int(row["n_clusters"]), None)
+        mid = (best_plateau[0] + best_plateau[1] - 1) // 2
+        row = subset.iloc[mid]
+        return (float(row["resolution"]), int(row["n_clusters"]), best_plateau_df)
+    raise ValueError(f"metric must be 'silhouette', 'davies_bouldin', or 'combined'; got {metric!r}")

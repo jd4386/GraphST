@@ -1,5 +1,6 @@
 import torch
-from .preprocess import preprocess_adj, preprocess_adj_sparse, preprocess, construct_interaction, construct_interaction_KNN, add_contrastive_label, get_feature, permutation, fix_seed, build_cluster_adjacency
+from .preprocess import preprocess_adj, preprocess_adj_sparse, preprocess, construct_interaction, construct_interaction_KNN, add_contrastive_label, get_feature, permutation, fix_seed
+from .utils import clustering, resolution_sweep_leiden, pick_resolution_from_sweep
 import time
 import random
 import numpy as np
@@ -70,11 +71,12 @@ class GraphST():
             Weight factor to control the influence of contrastive loss in mapping matrix learning. 
             The default is 1.
         lamda_cluster : float, optional
-            Weight for within-cluster smoothness loss on W (used only when spot_cluster_labels is provided).
-            The default is 0.0 when no labels, else e.g. 1.0.
+            Weight for within-cluster smoothness loss on W. When n_clusters_for_leiden is passed to
+            train_map(), smoothness uses Leiden-derived clusters; else uses spot_cluster_labels if provided.
         spot_cluster_labels : array-like, optional
-            1D integer array (length n_spot); -1 for missing. When provided, same-cluster spots are added
-            as positive pairs in contrastive learning and within-cluster smoothness is applied to W.
+            1D integer array (length n_spot); -1 for missing. If provided, used only for within-cluster
+            smoothness in loss() (when train_map is called without n_clusters_for_leiden). Same-cluster
+            spots are no longer added as contrastive positive pairs; contrastive uses spatial neighbors only.
         deconvolution : bool, optional
             Deconvolution task? The default is False.
         datatype : string, optional    
@@ -96,7 +98,7 @@ class GraphST():
         self.theta = theta
         self.lamda1 = lamda1
         self.lamda2 = lamda2
-        self.lamda_cluster = lamda_cluster if spot_cluster_labels is not None else 0.0
+        self.lamda_cluster = lamda_cluster
         self.spot_cluster_labels = spot_cluster_labels
         self.deconvolution = deconvolution
         self.datatype = datatype
@@ -122,14 +124,8 @@ class GraphST():
         self.features_a = torch.FloatTensor(self.adata.obsm['feat_a'].copy()).to(self.device)
         self.label_CSL = torch.FloatTensor(self.adata.obsm['label_CSL']).to(self.device)
         self.adj = self.adata.obsm['adj']
+        # Positive pairs for contrastive learning: spatial neighbors only (no same-cluster edges).
         graph_neigh = self.adata.obsm['graph_neigh'].copy().astype(np.float64) + np.eye(self.adj.shape[0])
-        if spot_cluster_labels is not None:
-            spot_cluster_labels = np.asarray(spot_cluster_labels).ravel()
-            if len(spot_cluster_labels) != graph_neigh.shape[0]:
-                raise ValueError("spot_cluster_labels length must match n_spot")
-            cluster_adj = build_cluster_adjacency(spot_cluster_labels, missing_label=-1)
-            graph_neigh = np.maximum(graph_neigh, cluster_adj)
-            graph_neigh = (graph_neigh > 0).astype(np.float64)
         self.graph_neigh = torch.FloatTensor(graph_neigh).to(self.device)
     
         self.dim_input = self.features.shape[1]
@@ -239,50 +235,102 @@ class GraphST():
          
             return emb_sc
         
-    def train_map(self):
+    def train_map(
+        self,
+        n_clusters_for_leiden=None,
+        run_resolution_sweep=False,
+        sweep_start=0.1,
+        sweep_end=2.0,
+        sweep_step=0.05,
+        pick_by_metric=False,
+        pick_metric='combined',
+        pick_k_min=2,
+        pick_k_max=15,
+        plateau_min_length=3,
+    ):
+        """Learn spot-to-cell mapping. Optionally run Leiden on the spot embedding (fixed k or sweep+pick)
+        and use unrefined labels for within-cluster smoothness and set self.adata.obs['domain'].
+        Returns (self.adata, self.adata_sc, sweep_df, plateau_df). sweep_df/plateau_df are None when no sweep."""
         emb_sp = self.train()
         emb_sc = self.train_sc()
-        
+
         self.adata.obsm['emb_sp'] = emb_sp.detach().cpu().numpy()
         self.adata_sc.obsm['emb_sc'] = emb_sc.detach().cpu().numpy()
-        
+
         # Normalize features for consistence between ST and scRNA-seq
         emb_sp = F.normalize(emb_sp, p=2, eps=1e-12, dim=1)
         emb_sc = F.normalize(emb_sc, p=2, eps=1e-12, dim=1)
-        
-        self.model_map = Encoder_map(self.n_cell, self.n_spot).to(self.device)  
-          
+
+        leiden_labels = None
+        sweep_df = None
+        plateau_df = None
+
+        if run_resolution_sweep and pick_by_metric and self.lamda_cluster > 0:
+            # Sweep + pick: one Leiden at chosen resolution; set domain and use for smoothness.
+            adata_sweep = self.adata.copy()
+            adata_sweep.obsm['emb'] = self.adata.obsm['emb_sp'].copy()
+            sweep_df = resolution_sweep_leiden(
+                adata_sweep,
+                start=sweep_start,
+                end=sweep_end,
+                step=sweep_step,
+                use_rep='emb_pca',
+                n_neighbors=50,
+                random_state=0,
+            )
+            chosen_resolution, chosen_n_clusters, plateau_df = pick_resolution_from_sweep(
+                sweep_df,
+                metric=pick_metric,
+                k_min=pick_k_min,
+                k_max=pick_k_max,
+                plateau_min_length=plateau_min_length,
+            )
+            adata_final = self.adata.copy()
+            adata_final.obsm['emb'] = self.adata.obsm['emb_sp'].copy()
+            clustering(adata_final, method='leiden', resolution=chosen_resolution)
+            leiden_labels = pd.to_numeric(adata_final.obs['domain'], errors='coerce').fillna(-1).astype(np.int64).values
+            self.adata.obs['domain'] = adata_final.obs['domain'].values
+        elif n_clusters_for_leiden is not None and self.lamda_cluster > 0:
+            # Fixed k: Leiden with n_clusters_for_leiden; set domain and use for smoothness.
+            adata_for_cluster = self.adata.copy()
+            adata_for_cluster.obsm['emb'] = adata_for_cluster.obsm['emb_sp'].copy()
+            clustering(adata_for_cluster, n_clusters=n_clusters_for_leiden, method='leiden')
+            leiden_labels = pd.to_numeric(adata_for_cluster.obs['domain'], errors='coerce').fillna(-1).astype(np.int64).values
+            self.adata.obs['domain'] = adata_for_cluster.obs['domain'].values
+
+        self.model_map = Encoder_map(self.n_cell, self.n_spot).to(self.device)
+
         self.optimizer_map = torch.optim.Adam(self.model_map.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
-        
+
         print('Begin to learn mapping matrix...')
         for epoch in tqdm(range(self.epochs)):
             self.model_map.train()
             self.map_matrix = self.model_map()
 
-            loss_recon, loss_NCE, loss_cluster = self.loss(emb_sp, emb_sc)
-             
-            loss = self.lamda1*loss_recon + self.lamda2*loss_NCE + self.lamda_cluster * loss_cluster 
+            loss_recon, loss_NCE, loss_cluster = self.loss(emb_sp, emb_sc, spot_cluster_labels=leiden_labels)
+
+            loss = self.lamda1*loss_recon + self.lamda2*loss_NCE + self.lamda_cluster * loss_cluster
 
             self.optimizer_map.zero_grad()
             loss.backward()
             self.optimizer_map.step()
-            
+
         print("Mapping matrix learning finished!")
-        
+
         # take final softmax w/o computing gradients
         with torch.no_grad():
             self.model_map.eval()
             emb_sp = emb_sp.cpu().numpy()
             emb_sc = emb_sc.cpu().numpy()
             map_matrix = F.softmax(self.map_matrix, dim=1).cpu().numpy() # dim=1: normalization by cell
-            
+
             self.adata.obsm['emb_sp'] = emb_sp
             self.adata_sc.obsm['emb_sc'] = emb_sc
             self.adata.obsm['map_matrix'] = map_matrix.T # spot x cell
 
-            return self.adata, self.adata_sc
+            return self.adata, self.adata_sc, sweep_df, plateau_df
     
-    def loss(self, emb_sp, emb_sc):
+    def loss(self, emb_sp, emb_sc, spot_cluster_labels=None):
         '''\
         Calculate loss
 
@@ -292,10 +340,13 @@ class GraphST():
             Spatial spot representation matrix.
         emb_sc : torch tensor
             scRNA cell representation matrix.
+        spot_cluster_labels : array-like, optional
+            If provided, use for within-cluster smoothness (e.g. Leiden labels from train_map).
+            Else use self.spot_cluster_labels when set (backward compatibility).
 
         Returns
         -------
-        loss_recon, loss_NCE, loss_cluster (loss_cluster is 0 if no spot_cluster_labels).
+        loss_recon, loss_NCE, loss_cluster (loss_cluster is 0 if no cluster labels).
 
         '''
         # cell-to-spot
@@ -308,8 +359,9 @@ class GraphST():
         # Within-cluster smoothness on W rows (map_matrix columns).
         # Use variance formulation: sum_{i<j} ||col_i - col_j||^2 = n_k * sum_i ||col_i - mean||^2
         # per cluster, to avoid O(n_pairs) computation graph and GPU OOM.
-        if self.spot_cluster_labels is not None and self.lamda_cluster > 0:
-            labels = np.asarray(self.spot_cluster_labels).ravel()
+        labels_to_use = spot_cluster_labels if spot_cluster_labels is not None else self.spot_cluster_labels
+        if labels_to_use is not None and self.lamda_cluster > 0:
+            labels = np.asarray(labels_to_use).ravel()
             n_pairs_total = 0
             loss_cluster_sum = 0.0
             for k in np.unique(labels):
