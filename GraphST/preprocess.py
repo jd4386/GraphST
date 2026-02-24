@@ -96,7 +96,12 @@ def construct_interaction_KNN(adata, n_neighbors=3):
     print('Graph constructed!')   
 
 def preprocess(adata):
-    sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=3000)
+    try:
+        sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=3000)
+    except ValueError:
+        import warnings
+        warnings.warn("Seurat v3 HVG failed (numerical singularity), falling back to flavor='seurat'", UserWarning)
+        sc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=3000)
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
     sc.pp.scale(adata, zero_center=False, max_value=10)
