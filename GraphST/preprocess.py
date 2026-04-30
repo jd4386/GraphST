@@ -11,6 +11,9 @@ from scipy.sparse.csc import csc_matrix
 from scipy.sparse.csr import csr_matrix
 from sklearn.neighbors import NearestNeighbors 
 
+HVG_TOP_GENES = 3000
+HVG_RETRY_MIN_CELLS = (3, 5)
+
 def filter_with_overlap_gene(adata, adata_sc):
     # remove all-zero-valued genes
     #sc.pp.filter_genes(adata, min_cells=1)
@@ -95,13 +98,53 @@ def construct_interaction_KNN(adata, n_neighbors=3):
     adata.obsm['adj'] = adj
     print('Graph constructed!')   
 
-def preprocess(adata):
+def _copy_hvg_annotations(target, source):
+    for col in (
+        "highly_variable",
+        "highly_variable_rank",
+        "means",
+        "variances",
+        "variances_norm",
+        "dispersions",
+        "dispersions_norm",
+    ):
+        if col in target.var.columns:
+            del target.var[col]
+    for col in source.var.columns:
+        target.var[col] = source.var[col].reindex(target.var_names)
+
+def _run_hvg_with_min_cells_retry(adata):
+    import warnings
+
     try:
-        sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=3000)
-    except ValueError:
-        import warnings
-        warnings.warn("Seurat v3 HVG failed (numerical singularity), falling back to flavor='seurat'", UserWarning)
-        sc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=3000)
+        sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=HVG_TOP_GENES)
+        return
+    except ValueError as exc:
+        last_exc = exc
+
+    for min_cells in HVG_RETRY_MIN_CELLS:
+        gene_counts = np.asarray((adata.X > 0).sum(axis=0)).ravel()
+        keep_mask = gene_counts >= min_cells
+        if keep_mask.sum() < HVG_TOP_GENES:
+            continue
+        adata_retry = adata[:, keep_mask].copy()
+        try:
+            sc.pp.highly_variable_genes(adata_retry, flavor="seurat_v3", n_top_genes=HVG_TOP_GENES)
+            warnings.warn(
+                f"Seurat v3 HVG required min_cells>={min_cells} prefilter after singularity; "
+                "default path is unchanged for samples that do not hit this retry.",
+                UserWarning,
+            )
+            _copy_hvg_annotations(adata, adata_retry)
+            adata.var["highly_variable"] = adata.var["highly_variable"].eq(True)
+            return
+        except ValueError as exc:
+            last_exc = exc
+
+    raise last_exc
+
+def preprocess(adata):
+    _run_hvg_with_min_cells_retry(adata)
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
     sc.pp.scale(adata, zero_center=False, max_value=10)
